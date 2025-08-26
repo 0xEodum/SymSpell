@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"unicode"
+	"unicode/utf8"
 
 	verbositypkg "symspell/pkg/verbosity"
 
@@ -43,7 +44,7 @@ func (s *SymSpell) LookupCompound(phrase string, maxEditDistance int) *items.Sug
 	}
 	for i := range terms1 {
 		cp.terms1 = terms1[i]
-		if i != len(terms1)-1 || len(cp.terms1) > s.MinimumCharToChange {
+		if i != len(terms1)-1 || runeLen(cp.terms1) > s.MinimumCharToChange {
 			s.replaceExactMatch(&cp)
 		}
 		s.getSuggestion(&cp, maxEditDistance)
@@ -63,7 +64,7 @@ func (s *SymSpell) LookupCompound(phrase string, maxEditDistance int) *items.Sug
 		cp.isLastCombi = false
 
 		// Handle terms with no perfect suggestion
-		if len(cp.suggestions) > 0 && (cp.suggestions[0].Distance == 0 || len(cp.terms1) == 1) {
+		if len(cp.suggestions) > 0 && (cp.suggestions[0].Distance == 0 || runeLen(cp.terms1) == 1) {
 			cp.suggestionParts = append(cp.suggestionParts, cp.suggestions[0])
 		} else {
 			var suggestionSplitBest *items.SuggestItem
@@ -74,7 +75,7 @@ func (s *SymSpell) LookupCompound(phrase string, maxEditDistance int) *items.Sug
 			if suggestionSplitBest != nil && suggestionSplitBest.Count > s.SplitThreshold && len(terms1) == 1 {
 				shouldSplit = false
 			}
-			if len(cp.terms1) > 1 && shouldSplit {
+			if runeLen(cp.terms1) > 1 && shouldSplit {
 				runes := []rune(cp.terms1)
 				for j := 1; j < len(runes); j++ {
 					suggestions1, suggestions2, isValid := s.getSuggestions(runes, j, maxEditDistance)
@@ -118,7 +119,7 @@ func (s *SymSpell) LookupCompound(phrase string, maxEditDistance int) *items.Sug
 }
 
 func (s *SymSpell) getSuggestion(cp *compoundProcessor, maxEditDistance int) {
-	if len(cp.terms1) > s.MinimumCharToChange {
+	if runeLen(cp.terms1) > s.MinimumCharToChange {
 		cp.suggestions, _ = s.Lookup(cp.terms1, verbositypkg.Top, maxEditDistance)
 	} else {
 		cp.suggestions = []items.SuggestItem{{
@@ -390,4 +391,11 @@ func splitWordAndNumber(input string) []string {
 	group2 := string(runes[transitionIndex:])
 	// Combine the groups with a space.
 	return []string{group1, group2}
+}
+
+func runeLen(s string) int {
+	if isASCII(s) {
+		return len(s)
+	}
+	return utf8.RuneCountInString(s)
 }

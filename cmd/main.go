@@ -33,6 +33,7 @@ func main() {
 	if !ok {
 		log.Fatal("Не удалось загрузить словарь")
 	}
+	spellChecker.ClearTransformData()
 
 	fmt.Println("Словарь успешно загружен!")
 	fmt.Println("Введите слова для проверки (каждое слово или фразу на отдельной строке).")
