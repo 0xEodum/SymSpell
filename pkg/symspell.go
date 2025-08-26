@@ -27,6 +27,7 @@ func NewSymSpellWithLoadDictionary(dirPath string, termIndex, countIndex int, op
 	if !ok {
 		log.Fatal("[Error] loading dictionary has been failed")
 	}
+	symspell.ClearTransformData()
 	return symspell
 }
 

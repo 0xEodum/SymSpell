@@ -4,6 +4,8 @@ import (
 	"errors"
 	"sort"
 	"strings"
+	"sync"
+	"unicode/utf8"
 
 	"symspell/pkg/items"
 	verbositypkg "symspell/pkg/verbosity"
@@ -17,34 +19,51 @@ func (s *SymSpell) Lookup(
 	if maxEditDistance > s.MaxDictionaryEditDistance {
 		return nil, errors.New("distance too large")
 	}
-	cp := newCandidateProcessor(maxEditDistance, verbosity, phrase)
+	if verbosity == verbositypkg.Top {
+		if item, ok := s.topCache.Get(phrase); ok {
+			return []items.SuggestItem{item}, nil
+		}
+	}
+	cp := acquireCandidateProcessor(maxEditDistance, verbosity, phrase)
 	// Early exit - word too big to match any words
 	if cp.phraseLen-maxEditDistance > s.maxLength {
-		return cp.suggestions, nil
+		res := append([]items.SuggestItem(nil), cp.suggestions...)
+		releaseCandidateProcessor(cp)
+		return res, nil
 	}
 
-	exactMatch := s.checkExactMatch(phrase, verbosity, &cp)
+	exactMatch := s.checkExactMatch(phrase, verbosity, cp)
 
 	if exactMatch.shouldStop {
-		return cp.suggestions, nil
+		res := append([]items.SuggestItem(nil), cp.suggestions...)
+		releaseCandidateProcessor(cp)
+		return res, nil
 	}
 
 	if maxEditDistance == 0 {
-		return cp.suggestions, nil
+		res := append([]items.SuggestItem(nil), cp.suggestions...)
+		releaseCandidateProcessor(cp)
+		return res, nil
 	}
-	cp.consideredSuggestions[phrase] = true
+	cp.consideredSuggestions[phrase] = struct{}{}
 	// Add original prefix
-	phrasePrefixRunes := s.getOriginPrefix(&cp)
-	cp.candidates = append(cp.candidates, string(phrasePrefixRunes))
+	phrasePrefix := s.getOriginPrefix(cp)
+	cp.candidates = append(cp.candidates, phrasePrefix)
 	// Process candidates
-	s.processCandidate(maxEditDistance, &cp)
+	s.processCandidate(maxEditDistance, cp)
 
 	// Финальная обработка с учетом относительной частотности
-	s.finalizeWithFrequencyCheck(&cp, exactMatch.exactItem)
+	s.finalizeWithFrequencyCheck(cp, exactMatch.exactItem)
 
 	cp.sortCandidate()
 
-	return cp.suggestions, nil
+	result := append([]items.SuggestItem(nil), cp.suggestions...)
+	if verbosity == verbositypkg.Top && len(result) > 0 {
+		s.topCache.Add(phrase, result[0])
+	}
+	releaseCandidateProcessor(cp)
+
+	return result, nil
 }
 
 type ExactMatchResult struct {
@@ -52,12 +71,16 @@ type ExactMatchResult struct {
 	exactItem  *items.SuggestItem
 }
 
-func (s *SymSpell) getOriginPrefix(cp *candidateProcessor) []rune {
+func (s *SymSpell) getOriginPrefix(cp *candidateProcessor) string {
 	phrase := cp.phrase
 	if cp.phraseLen > s.PrefixLength {
-		phrase = cp.phrase[:s.PrefixLength]
+		if cp.unicode {
+			phrase = string(cp.phraseRunes[:s.PrefixLength])
+		} else {
+			phrase = phrase[:s.PrefixLength]
+		}
 	}
-	return []rune(phrase)
+	return phrase
 }
 
 func (s *SymSpell) checkExactMatch(phrase string, verbosity verbositypkg.Verbosity, cp *candidateProcessor) ExactMatchResult {
@@ -135,8 +158,11 @@ func (s *SymSpell) processCandidate(maxEditDistance int, cp *candidateProcessor)
 		}
 
 		// Check suggestions for the candidate
-		if dictSuggestions, found := s.Deletes[candidate]; found {
-			for _, idx := range dictSuggestions {
+		if v, found := s.DeletesIdx[candidate]; found {
+			offset := uint32(v >> 32)
+			length := uint32(v)
+			for i := offset; i < offset+length; i++ {
+				idx := s.DeletesData[i]
 				suggestion := s.words[idx]
 				if suggestion == cp.phrase {
 					continue
@@ -149,7 +175,10 @@ func (s *SymSpell) processCandidate(maxEditDistance int, cp *candidateProcessor)
 				cp.resetDistance()
 				if cp.candidateLen == 0 {
 					cp.distance = max(cp.phraseLen, cp.suggestionLen)
-					if cp.distance > cp.maxEditDistance2 || cp.consideredSuggestions[suggestion] {
+					if cp.distance > cp.maxEditDistance2 {
+						continue
+					}
+					if _, ok := cp.consideredSuggestions[suggestion]; ok {
 						continue
 					}
 				} else if cp.suggestionLen == 1 {
@@ -165,7 +194,7 @@ func (s *SymSpell) processCandidate(maxEditDistance int, cp *candidateProcessor)
 					}
 				}
 				if cp.distance <= cp.maxEditDistance2 {
-					s.updateSuggestions(suggestion, cp)
+					s.updateSuggestions(idx, suggestion, cp)
 				}
 			}
 		}
@@ -181,7 +210,12 @@ func (s *SymSpell) processCandidate(maxEditDistance int, cp *candidateProcessor)
 func (s *SymSpell) preProcessCandidate(cp *candidateProcessor) string {
 	candidate := cp.candidates[cp.candidatePointer]
 	cp.candidatePointer++
-	cp.candidateLen = len(candidate)
+	if cp.unicode {
+		cp.candidateRunes = []rune(candidate)
+		cp.candidateLen = len(cp.candidateRunes)
+	} else {
+		cp.candidateLen = len(candidate)
+	}
 	cp.lenDiff = cp.phraseLen - cp.candidateLen
 	return candidate
 }
@@ -207,10 +241,10 @@ func (s *SymSpell) checkDistanceToSkip(maxEditDistance int, cp *candidateProcess
 	}
 	// delete in suggestion prefix is somewhat expensive, and
 	// only pays off when verbosity is TOP or CLOSEST
-	if cp.consideredSuggestions[suggestion] {
+	if _, ok := cp.consideredSuggestions[suggestion]; ok {
 		return true
 	}
-	cp.consideredSuggestions[suggestion] = true
+	cp.consideredSuggestions[suggestion] = struct{}{}
 	cp.distance = s.distanceCompare(cp.phrase, suggestion, cp.maxEditDistance2)
 	return cp.distance < 0
 }
@@ -224,19 +258,58 @@ func (s *SymSpell) updateMinDistance(maxEditDistance int, cp *candidateProcessor
 }
 
 func (s *SymSpell) checkFirstRuneDistance(cp *candidateProcessor, suggestion string) bool {
+	if cp.unicode {
+		first := cp.suggestionRunes[0]
+		found := false
+		for _, r := range cp.phraseRunes {
+			if r == first {
+				found = true
+				break
+			}
+		}
+		if found {
+			cp.distance = cp.phraseLen - 1
+		} else {
+			cp.distance = cp.phraseLen
+		}
+		if cp.distance > cp.maxEditDistance2 {
+			return true
+		}
+		if _, ok := cp.consideredSuggestions[suggestion]; ok {
+			return true
+		}
+		return false
+	}
 	first := suggestion[0]
 	if strings.IndexByte(cp.phrase, first) >= 0 {
 		cp.distance = cp.phraseLen - 1
 	} else {
 		cp.distance = cp.phraseLen
 	}
-	if cp.distance > cp.maxEditDistance2 || cp.consideredSuggestions[suggestion] {
+	if cp.distance > cp.maxEditDistance2 {
+		return true
+	}
+	if _, ok := cp.consideredSuggestions[suggestion]; ok {
 		return true
 	}
 	return false
 }
 
 func (s *SymSpell) checkProcessShouldSkip(cp *candidateProcessor, suggestion string) bool {
+	if cp.unicode {
+		pr := cp.phraseRunes
+		sr := cp.suggestionRunes
+		if cp.minDistance > 1 && !runesEqual(pr[cp.phraseLen+1-cp.minDistance:], sr[cp.suggestionLen+1-cp.minDistance:]) {
+			return true
+		}
+		if cp.minDistance > 0 && pr[cp.phraseLen-cp.minDistance] != sr[cp.suggestionLen-cp.minDistance] {
+			if pr[cp.phraseLen-cp.minDistance-1] != sr[cp.suggestionLen-cp.minDistance] ||
+				pr[cp.phraseLen-cp.minDistance] != sr[cp.suggestionLen-cp.minDistance-1] {
+				return true
+			}
+		}
+		return false
+	}
 	phrase := cp.phrase
 	if cp.minDistance > 1 && phrase[cp.phraseLen+1-cp.minDistance:] != suggestion[cp.suggestionLen+1-cp.minDistance:] {
 		return true
@@ -250,8 +323,7 @@ func (s *SymSpell) checkProcessShouldSkip(cp *candidateProcessor, suggestion str
 	return false
 }
 
-func (s *SymSpell) updateSuggestions(suggestion string, cp *candidateProcessor) {
-	idx := s.Words[suggestion]
+func (s *SymSpell) updateSuggestions(idx uint32, suggestion string, cp *candidateProcessor) {
 	suggestionCount := s.counts[idx]
 	item := items.SuggestItem{Term: suggestion, Distance: cp.distance, Count: int(suggestionCount)}
 
@@ -284,20 +356,28 @@ func (s *SymSpell) updateBestSuggestion(cp *candidateProcessor, suggestionCount 
 }
 
 func (s *SymSpell) addEditDistance(candidate string, cp *candidateProcessor) {
-	runes := []rune(candidate)
+	if !cp.unicode {
+		for i := 0; i < len(candidate); i++ {
+			deleteItem := candidate[:i] + candidate[i+1:]
+			if _, ok := cp.consideredDeletes[deleteItem]; !ok {
+				cp.consideredDeletes[deleteItem] = struct{}{}
+				cp.candidates = append(cp.candidates, deleteItem)
+			}
+		}
+		return
+	}
+	runes := cp.candidateRunes
 	for i := 0; i < len(runes); i++ {
 		deleteItem := string(runes[:i]) + string(runes[i+1:])
-		if !cp.consideredDeletes[deleteItem] {
-			cp.consideredDeletes[deleteItem] = true
+		if _, ok := cp.consideredDeletes[deleteItem]; !ok {
+			cp.consideredDeletes[deleteItem] = struct{}{}
 			cp.candidates = append(cp.candidates, deleteItem)
 		}
 	}
 }
 
 func (s *SymSpell) distanceCompare(a, b string, maxDistance int) int {
-	distance := s.distanceComparer.Distance(a, b)
-
-	// Check if the distance exceeds the maxDistance
+	distance := s.distanceComparer.DistanceMax(a, b, maxDistance)
 	if distance > maxDistance {
 		return -1
 	}
@@ -311,39 +391,93 @@ func abs(a int) int {
 	return a
 }
 
+func isASCII(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] >= utf8.RuneSelf {
+			return false
+		}
+	}
+	return true
+}
+
+func runesEqual(a, b []rune) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
 type candidateProcessor struct {
 	candidates            []string
-	consideredDeletes     map[string]bool
-	consideredSuggestions map[string]bool
+	consideredDeletes     map[string]struct{}
+	consideredSuggestions map[string]struct{}
 	maxEditDistance2      int
 	candidatePointer      int
 	verbosity             verbositypkg.Verbosity
 	phraseLen             int
 	phrase                string
+	phraseRunes           []rune
+	unicode               bool
 	candidateLen          int
+	candidateRunes        []rune
 	distance              int
 	minDistance           int
 	suggestions           []items.SuggestItem
 	suggestionLen         int
+	suggestionRunes       []rune
 	lenDiff               int
 }
 
-func newCandidateProcessor(maxEditDistance int, verbosity verbositypkg.Verbosity, phrase string) candidateProcessor {
-	return candidateProcessor{
-		candidates:            make([]string, 0),
-		consideredDeletes:     make(map[string]bool),
-		consideredSuggestions: make(map[string]bool),
-		maxEditDistance2:      maxEditDistance,
-		candidatePointer:      0,
-		verbosity:             verbosity,
-		phraseLen:             len(phrase),
-		phrase:                phrase,
-		candidateLen:          0,
-		distance:              0,
-		minDistance:           0,
-		suggestions:           []items.SuggestItem{},
-		lenDiff:               0,
+var candidateProcessorPool = sync.Pool{
+	New: func() any {
+		return &candidateProcessor{
+			candidates:            make([]string, 0),
+			consideredDeletes:     make(map[string]struct{}),
+			consideredSuggestions: make(map[string]struct{}),
+			suggestions:           make([]items.SuggestItem, 0),
+		}
+	},
+}
+
+func acquireCandidateProcessor(maxEditDistance int, verbosity verbositypkg.Verbosity, phrase string) *candidateProcessor {
+	cp := candidateProcessorPool.Get().(*candidateProcessor)
+	cp.maxEditDistance2 = maxEditDistance
+	cp.candidatePointer = 0
+	cp.verbosity = verbosity
+	cp.phrase = phrase
+	cp.unicode = !isASCII(phrase)
+	if cp.unicode {
+		cp.phraseRunes = []rune(phrase)
+		cp.phraseLen = len(cp.phraseRunes)
+	} else {
+		cp.phraseRunes = nil
+		cp.phraseLen = len(phrase)
 	}
+	cp.candidateLen = 0
+	cp.candidateRunes = nil
+	cp.distance = 0
+	cp.minDistance = 0
+	cp.suggestions = cp.suggestions[:0]
+	cp.suggestionLen = 0
+	cp.suggestionRunes = nil
+	cp.lenDiff = 0
+	cp.candidates = cp.candidates[:0]
+	clear(cp.consideredDeletes)
+	clear(cp.consideredSuggestions)
+	return cp
+}
+
+func releaseCandidateProcessor(cp *candidateProcessor) {
+	cp.phrase = ""
+	cp.phraseRunes = nil
+	cp.candidateRunes = nil
+	cp.suggestionRunes = nil
+	candidateProcessorPool.Put(cp)
 }
 
 func (c *candidateProcessor) resetDistance() {
@@ -351,7 +485,12 @@ func (c *candidateProcessor) resetDistance() {
 }
 
 func (c *candidateProcessor) updateSuggestion(suggestion string) {
-	c.suggestionLen = len(suggestion)
+	if c.unicode {
+		c.suggestionRunes = []rune(suggestion)
+		c.suggestionLen = len(c.suggestionRunes)
+	} else {
+		c.suggestionLen = len(suggestion)
+	}
 }
 
 func (c *candidateProcessor) sortCandidate() {

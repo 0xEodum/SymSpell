@@ -8,6 +8,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"unicode/utf8"
 
 	"symspell/pkg/editdistance"
@@ -30,7 +31,8 @@ type SymSpell struct {
 	FrequencyMultiplier       int // Новое поле: множитель для сравнения частот
 	Words                     map[string]uint32
 	BelowThresholdWords       map[string]uint32
-	Deletes                   map[string][]uint32
+	DeletesIdx                map[string]uint64
+	DeletesData               []uint32
 	ExactTransform            map[string]string
 	words                     []string
 	counts                    []uint32
@@ -40,6 +42,7 @@ type SymSpell struct {
 	N              float64
 	Bigrams        map[string]uint32
 	BigramCountMin uint32
+	topCache       *topCache
 }
 
 // NewSymSpell is the constructor for the SymSpell struct.
@@ -80,7 +83,8 @@ func NewSymSpell(opt ...options.Options) (*SymSpell, error) {
 		FrequencyMultiplier:       opts.FrequencyMultiplier,
 		Words:                     make(map[string]uint32),
 		BelowThresholdWords:       make(map[string]uint32),
-		Deletes:                   make(map[string][]uint32),
+		DeletesIdx:                make(map[string]uint64),
+		DeletesData:               make([]uint32, 0),
 		ExactTransform:            nil,
 		words:                     make([]string, 0),
 		counts:                    make([]uint32, 0),
@@ -89,11 +93,12 @@ func NewSymSpell(opt ...options.Options) (*SymSpell, error) {
 		Bigrams:                   nil,
 		N:                         1024908267229,
 		BigramCountMin:            maxUint32,
+		topCache:                  newTopCache(128),
 	}, nil
 }
 
 // createDictionaryEntry creates or updates an entry in the dictionary.
-func (s *SymSpell) createDictionaryEntry(key string, count uint32) bool {
+func (s *SymSpell) addWordEntry(key string, count uint32) bool {
 	if count == 0 {
 		if s.CountThreshold > 0 {
 			return false
@@ -127,11 +132,45 @@ func (s *SymSpell) createDictionaryEntry(key string, count uint32) bool {
 		s.maxLength = len(key)
 	}
 
+	return true
+}
+
+func (s *SymSpell) addDeletesForIndex(key string, index uint32) {
 	edits := s.editsPrefix(key)
 	for deleteWord := range edits {
-		s.Deletes[deleteWord] = append(s.Deletes[deleteWord], index)
+		if v, found := s.DeletesIdx[deleteWord]; found {
+			offset := uint32(v >> 32)
+			length := uint32(v)
+			insertPos := offset + length
+			s.DeletesData = append(s.DeletesData, 0)
+			copy(s.DeletesData[insertPos+1:], s.DeletesData[insertPos:])
+			s.DeletesData[insertPos] = index
+			for k, val := range s.DeletesIdx {
+				if k == deleteWord {
+					continue
+				}
+				o := uint32(val >> 32)
+				l := uint32(val)
+				if o >= insertPos {
+					s.DeletesIdx[k] = uint64(o+1)<<32 | uint64(l)
+				}
+			}
+			s.DeletesIdx[deleteWord] = uint64(offset)<<32 | uint64(length+1)
+		} else {
+			offset := uint32(len(s.DeletesData))
+			s.DeletesData = append(s.DeletesData, index)
+			s.DeletesIdx[deleteWord] = uint64(offset)<<32 | 1
+		}
 	}
+}
 
+// createDictionaryEntry creates or updates an entry in the dictionary.
+func (s *SymSpell) createDictionaryEntry(key string, count uint32) bool {
+	if !s.addWordEntry(key, count) {
+		return false
+	}
+	index := uint32(len(s.words) - 1)
+	s.addDeletesForIndex(key, index)
 	return true
 }
 
@@ -189,25 +228,84 @@ func (s *SymSpell) LoadDictionary(corpusPath string, termIndex int, countIndex i
 	}
 	defer file.Close()
 
-	// Load dictionary data from file
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
 		line := scanner.Text()
-		fields := strings.Split(line, separator)
-		if len(fields) <= max(termIndex, countIndex) {
-			continue // Skip invalid lines
+		var term string
+		var c64 uint64
+		var err error
+		if separator == "" || separator == " " {
+			fields := strings.Fields(line)
+			if len(fields) <= max(termIndex, countIndex) {
+				continue
+			}
+			term = fields[termIndex]
+			c64, err = strconv.ParseUint(fields[countIndex], 10, 32)
+			if err != nil {
+				continue
+			}
+		} else if termIndex == 0 && countIndex == 1 {
+			idx := strings.LastIndex(line, separator)
+			if idx < 0 {
+				continue
+			}
+			term = line[:idx]
+			c64, err = strconv.ParseUint(line[idx+len(separator):], 10, 32)
+			if err != nil {
+				continue
+			}
+		} else {
+			fields := strings.Split(line, separator)
+			if len(fields) <= max(termIndex, countIndex) {
+				continue
+			}
+			term = fields[termIndex]
+			c64, err = strconv.ParseUint(fields[countIndex], 10, 32)
+			if err != nil {
+				continue
+			}
 		}
-
-		term := fields[termIndex]
-		c, err := strconv.ParseUint(fields[countIndex], 10, 32)
-		if err != nil {
-			continue // Skip invalid counts
-		}
-		s.createDictionaryEntry(term, uint32(c))
+		s.addWordEntry(term, uint32(c64))
 	}
 
 	if err = scanner.Err(); err != nil {
 		return false, err
+	}
+
+	shardCount := 16
+	type shardMap map[string][]uint32
+	shards := make([]shardMap, shardCount)
+	for i := 0; i < shardCount; i++ {
+		shards[i] = make(shardMap)
+	}
+
+	var wg sync.WaitGroup
+	for i := 0; i < shardCount; i++ {
+		wg.Add(1)
+		go func(offset int, shard shardMap) {
+			defer wg.Done()
+			for idx := offset; idx < len(s.words); idx += shardCount {
+				word := s.words[idx]
+				edits := s.editsPrefix(word)
+				for del := range edits {
+					shard[del] = append(shard[del], uint32(idx))
+				}
+			}
+		}(i, shards[i])
+	}
+	wg.Wait()
+
+	combined := make(map[string][]uint32)
+	for _, shard := range shards {
+		for del, slice := range shard {
+			combined[del] = append(combined[del], slice...)
+		}
+	}
+
+	for del, slice := range combined {
+		offset := uint32(len(s.DeletesData))
+		s.DeletesData = append(s.DeletesData, slice...)
+		s.DeletesIdx[del] = uint64(offset)<<32 | uint64(len(slice))
 	}
 
 	s.BelowThresholdWords = nil
