@@ -57,4 +57,5 @@ type SymSpell interface {
 	LoadBigramDictionary(corpusPath string, termIndex, countIndex int, separator string) (bool, error)
 	LoadDictionary(corpusPath string, termIndex int, countIndex int, separator string) (bool, error)
 	LoadExactDictionary(corpusPath string, separator string) (bool, error)
+	ClearTransformData()
 }
