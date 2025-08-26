@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"math"
 	"os"
 	"strconv"
 	"strings"
@@ -14,6 +13,8 @@ import (
 	"symspell/pkg/editdistance"
 	"symspell/pkg/options"
 )
+
+const maxUint32 = ^uint32(0)
 
 // SymSpell represents the Symmetric Delete spelling correction algorithm.
 type SymSpell struct {
@@ -27,16 +28,18 @@ type SymSpell struct {
 	MinimumCharToChange       int
 	FrequencyThreshold        int // Новое поле: минимальная частота для точных совпадений
 	FrequencyMultiplier       int // Новое поле: множитель для сравнения частот
-	Words                     map[string]int
-	BelowThresholdWords       map[string]int
-	Deletes                   map[string][]string
+	Words                     map[string]uint32
+	BelowThresholdWords       map[string]uint32
+	Deletes                   map[string][]uint32
 	ExactTransform            map[string]string
+	words                     []string
+	counts                    []uint32
 	maxLength                 int
 	distanceComparer          editdistance.IEditDistance
 	// lookup compound
 	N              float64
-	Bigrams        map[string]int
-	BigramCountMin int
+	Bigrams        map[string]uint32
+	BigramCountMin uint32
 }
 
 // NewSymSpell is the constructor for the SymSpell struct.
@@ -75,64 +78,58 @@ func NewSymSpell(opt ...options.Options) (*SymSpell, error) {
 		MinimumCharToChange:       opts.MinimumCharacterToChange,
 		FrequencyThreshold:        opts.FrequencyThreshold,
 		FrequencyMultiplier:       opts.FrequencyMultiplier,
-		Words:                     make(map[string]int),
-		BelowThresholdWords:       make(map[string]int),
-		Deletes:                   make(map[string][]string),
-		ExactTransform:            make(map[string]string),
+		Words:                     make(map[string]uint32),
+		BelowThresholdWords:       make(map[string]uint32),
+		Deletes:                   make(map[string][]uint32),
+		ExactTransform:            nil,
+		words:                     make([]string, 0),
+		counts:                    make([]uint32, 0),
 		distanceComparer:          editdistance.NewEditDistance(editdistance.DamerauLevenshtein),
 		maxLength:                 0,
-		Bigrams:                   make(map[string]int),
+		Bigrams:                   nil,
 		N:                         1024908267229,
-		BigramCountMin:            math.MaxInt,
+		BigramCountMin:            maxUint32,
 	}, nil
 }
 
 // createDictionaryEntry creates or updates an entry in the dictionary.
-func (s *SymSpell) createDictionaryEntry(key string, count int) bool {
-	if count <= 0 {
-		// Early return if count is zero or less
+func (s *SymSpell) createDictionaryEntry(key string, count uint32) bool {
+	if count == 0 {
 		if s.CountThreshold > 0 {
 			return false
 		}
-		count = 0
 	}
 
-	// Check below-threshold words
 	if s.CountThreshold > 1 {
 		if countPrev, found := s.BelowThresholdWords[key]; found {
-			// Increment the count
 			count = incrementCount(count, countPrev)
-			// Check if it reaches the threshold
-			if count < s.CountThreshold {
+			if int(count) < s.CountThreshold {
 				s.BelowThresholdWords[key] = count
 				return false
-
 			}
 			delete(s.BelowThresholdWords, key)
 		}
-	} else if countPrev, found := s.Words[key]; found {
-		// Increment the count
-		s.Words[key] = incrementCount(count, countPrev)
+	} else if idx, found := s.Words[key]; found {
+		s.counts[idx] = incrementCount(count, s.counts[idx])
 		return false
 	}
-	if count < s.CountThreshold {
-		// Add to below-threshold words
+	if int(count) < s.CountThreshold {
 		s.BelowThresholdWords[key] = count
 		return false
 	}
 
-	// Add a new word
-	s.Words[key] = count
+	index := uint32(len(s.words))
+	s.words = append(s.words, key)
+	s.counts = append(s.counts, count)
+	s.Words[key] = index
 
-	// Update max length
 	if len(key) > s.maxLength {
 		s.maxLength = len(key)
 	}
 
-	// Create deletes
 	edits := s.editsPrefix(key)
 	for deleteWord := range edits {
-		s.Deletes[deleteWord] = append(s.Deletes[deleteWord], key)
+		s.Deletes[deleteWord] = append(s.Deletes[deleteWord], index)
 	}
 
 	return true
@@ -202,26 +199,27 @@ func (s *SymSpell) LoadDictionary(corpusPath string, termIndex int, countIndex i
 		}
 
 		term := fields[termIndex]
-		count, err := strconv.Atoi(fields[countIndex])
+		c, err := strconv.ParseUint(fields[countIndex], 10, 32)
 		if err != nil {
 			continue // Skip invalid counts
 		}
-		s.createDictionaryEntry(term, count)
+		s.createDictionaryEntry(term, uint32(c))
 	}
 
 	if err = scanner.Err(); err != nil {
 		return false, err
 	}
 
+	s.BelowThresholdWords = nil
+
 	return true, nil
 }
 
-func incrementCount(count, countPrevious int) int {
-	// Ensure the count does not exceed the maximum value for int64
-	if math.MaxInt64-countPrevious > count {
+func incrementCount(count, countPrevious uint32) uint32 {
+	if maxUint32-countPrevious > count {
 		return countPrevious + count
 	}
-	return math.MaxInt64
+	return maxUint32
 }
 
 func (s *SymSpell) LoadExactDictionary(
@@ -243,6 +241,9 @@ func (s *SymSpell) LoadExactDictionary(
 }
 
 func (s *SymSpell) LoadExactDictionaryStream(corpusStream *os.File, separator string) bool {
+	if s.ExactTransform == nil {
+		s.ExactTransform = make(map[string]string)
+	}
 	scanner := bufio.NewScanner(corpusStream)
 	// Define minimum parts depending on the separator
 	for scanner.Scan() {
@@ -268,4 +269,10 @@ func (s *SymSpell) LoadExactDictionaryStream(corpusStream *os.File, separator st
 		s.ExactTransform[key] = exactMatch
 	}
 	return true
+}
+
+// ClearTransformData releases memory used by optional bigram and transform maps.
+func (s *SymSpell) ClearTransformData() {
+	s.Bigrams = nil
+	s.ExactTransform = nil
 }

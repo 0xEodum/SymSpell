@@ -43,7 +43,7 @@ func (s *SymSpell) LookupCompound(phrase string, maxEditDistance int) *items.Sug
 	}
 	for i := range terms1 {
 		cp.terms1 = terms1[i]
-		if i != len(terms1)-1 || len([]rune(cp.terms1)) > s.MinimumCharToChange {
+		if i != len(terms1)-1 || len(cp.terms1) > s.MinimumCharToChange {
 			s.replaceExactMatch(&cp)
 		}
 		s.getSuggestion(&cp, maxEditDistance)
@@ -118,7 +118,7 @@ func (s *SymSpell) LookupCompound(phrase string, maxEditDistance int) *items.Sug
 }
 
 func (s *SymSpell) getSuggestion(cp *compoundProcessor, maxEditDistance int) {
-	if len([]rune(cp.terms1)) > s.MinimumCharToChange {
+	if len(cp.terms1) > s.MinimumCharToChange {
 		cp.suggestions, _ = s.Lookup(cp.terms1, verbositypkg.Top, maxEditDistance)
 	} else {
 		cp.suggestions = []items.SuggestItem{{
@@ -166,20 +166,19 @@ func (s *SymSpell) getSuggestions(runes []rune, split int, maxEditDistance int) 
 }
 
 func (s *SymSpell) checkForBigram(cp *compoundProcessor) int {
-	var tmpCount int
+	var tmpCount uint32
 	if count, exists := s.Bigrams[cp.tempTerm()]; exists {
 		tmpCount = count
 
-		// Update count if split corrections match
 		if len(cp.suggestions) > 0 {
 			bestSI := cp.suggestions[0]
 			if cp.suggestion1.Term+cp.suggestion2.Term == cp.terms1 {
-				tmpCount = int(math.Max(float64(tmpCount), float64(bestSI.Count+2)))
+				tmpCount = uint32(math.Max(float64(tmpCount), float64(bestSI.Count+2)))
 			} else if bestSI.Term == cp.suggestion1.Term || bestSI.Term == cp.suggestion2.Term {
-				tmpCount = int(math.Max(float64(tmpCount), float64(bestSI.Count+1)))
+				tmpCount = uint32(math.Max(float64(tmpCount), float64(bestSI.Count+1)))
 			}
 		} else if cp.suggestion1.Term+cp.suggestion2.Term == cp.terms1 {
-			tmpCount = int(math.Max(
+			tmpCount = uint32(math.Max(
 				float64(tmpCount),
 				math.Max(
 					float64(cp.suggestion1.Count),
@@ -188,13 +187,12 @@ func (s *SymSpell) checkForBigram(cp *compoundProcessor) int {
 			))
 		}
 	} else {
-		// Calculate Naive Bayes probability-based count
-		tmpCount = int(math.Min(
+		tmpCount = uint32(math.Min(
 			float64(s.BigramCountMin),
 			float64(cp.suggestion1.Count)/s.N*float64(cp.suggestion2.Count),
 		))
 	}
-	return tmpCount
+	return int(tmpCount)
 }
 
 func (c *compoundProcessor) updateReplaceWord(terms1 string, item items.SuggestItem) {
@@ -236,17 +234,20 @@ func createWithProbability(term string, distance int) items.SuggestItem {
 }
 
 // Helper function to safely parse integers
-func tryParseInt64(value string) (int, bool) {
-	parsed, err := strconv.Atoi(value)
+func tryParseUint32(value string) (uint32, bool) {
+	parsed, err := strconv.ParseUint(value, 10, 32)
 	if err != nil {
 		fmt.Println("[ERROR] parsing integer: ", err)
 		return 0, false
 	}
-	return parsed, true
+	return uint32(parsed), true
 }
 
 // Load bigram dictionary from a stream
 func (s *SymSpell) LoadBigramDictionaryStream(corpusStream *os.File, termIndex, countIndex int, separator string) bool {
+	if s.Bigrams == nil {
+		s.Bigrams = make(map[string]uint32)
+	}
 	scanner := bufio.NewScanner(corpusStream)
 
 	// Define minimum parts depending on the separator
@@ -274,7 +275,7 @@ func (s *SymSpell) LoadBigramDictionaryStream(corpusStream *os.File, termIndex, 
 		}
 
 		// Parse count
-		count, ok := tryParseInt64(parts[countIndex])
+		count, ok := tryParseUint32(parts[countIndex])
 		if !ok {
 			continue
 		}
@@ -289,7 +290,6 @@ func (s *SymSpell) LoadBigramDictionaryStream(corpusStream *os.File, termIndex, 
 		// Add to bigram dictionary
 		s.Bigrams[key] = count
 
-		// Update the minimum bigram count
 		if count < s.BigramCountMin {
 			s.BigramCountMin = count
 		}
