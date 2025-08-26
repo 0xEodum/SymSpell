@@ -16,16 +16,14 @@ func main() {
 	// Настройки SymSpell
 	maxEditDistance := 2
 
-	// Инициализация SymSpell с опциями
 	spellChecker := symspell.NewSymSpell(
 		options.WithMaxDictionaryEditDistance(maxEditDistance),
 		options.WithPrefixLength(4),
 		options.WithCountThreshold(1),
-		options.WithSmartFrequencyCorrection(), // Включаем умную коррекцию частотности
+		options.WithSmartFrequencyCorrection(),
 	)
 
-	// Загрузка словаря
-	dictionaryPath := "en_full.txt" // Путь к файлу со словарем
+	dictionaryPath := "en_full.txt"
 	fmt.Printf("Загружаем словарь из файла: %s\n", dictionaryPath)
 
 	ok, err := spellChecker.LoadDictionary(dictionaryPath, 0, 1, " ")

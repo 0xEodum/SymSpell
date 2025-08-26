@@ -73,8 +73,8 @@ func NewSymSpell(opt ...options.Options) (*SymSpell, error) {
 		SplitWordBySpace:          opts.SplitWordBySpace,
 		SplitWordAndNumber:        opts.SplitWordAndNumber,
 		MinimumCharToChange:       opts.MinimumCharacterToChange,
-		FrequencyThreshold:        opts.FrequencyThreshold,  // Новое поле
-		FrequencyMultiplier:       opts.FrequencyMultiplier, // Новое поле
+		FrequencyThreshold:        opts.FrequencyThreshold,
+		FrequencyMultiplier:       opts.FrequencyMultiplier,
 		Words:                     make(map[string]int),
 		BelowThresholdWords:       make(map[string]int),
 		Deletes:                   make(map[string][]string),

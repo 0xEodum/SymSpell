@@ -23,10 +23,8 @@ func (s *SymSpell) Lookup(
 		return cp.suggestions, nil
 	}
 
-	// Проверяем точное совпадение, но НЕ завершаем поиск сразу для низкочастотных слов
 	exactMatch := s.checkExactMatch(phrase, verbosity, &cp)
 
-	// Если нашли высокочастотное точное совпадение, можем завершить поиск
 	if exactMatch.shouldStop {
 		return cp.suggestions, nil
 	}

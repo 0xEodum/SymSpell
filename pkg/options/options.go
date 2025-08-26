@@ -90,26 +90,18 @@ func WithSplitWordAndNumbers() Options {
 	})
 }
 
-// Новые опции для настройки частотности
-
-// WithFrequencyThreshold устанавливает минимальную частоту для принятия точного совпадения
-// Если точное совпадение имеет частоту ниже этого порога, будут искаться альтернативы
 func WithFrequencyThreshold(threshold int) Options {
 	return NewFuncOption(func(options *SymspellOptions) {
 		options.FrequencyThreshold = threshold
 	})
 }
 
-// WithFrequencyMultiplier устанавливает, во сколько раз должна быть больше частота
-// альтернативы, чтобы она была предпочтена точному совпадению
 func WithFrequencyMultiplier(multiplier int) Options {
 	return NewFuncOption(func(options *SymspellOptions) {
 		options.FrequencyMultiplier = multiplier
 	})
 }
 
-// WithSmartFrequencyCorrection включает умную коррекцию на основе частотности
-// Эквивалентно WithFrequencyThreshold(1000) + WithFrequencyMultiplier(10)
 func WithSmartFrequencyCorrection() Options {
 	return NewFuncOption(func(options *SymspellOptions) {
 		options.FrequencyThreshold = 1000
@@ -117,8 +109,6 @@ func WithSmartFrequencyCorrection() Options {
 	})
 }
 
-// WithStrictFrequencyCorrection включает строгую коррекцию на основе частотности
-// Эквивалентно WithFrequencyThreshold(5000) + WithFrequencyMultiplier(5)
 func WithStrictFrequencyCorrection() Options {
 	return NewFuncOption(func(options *SymspellOptions) {
 		options.FrequencyThreshold = 5000
@@ -126,8 +116,6 @@ func WithStrictFrequencyCorrection() Options {
 	})
 }
 
-// WithLenientFrequencyCorrection включает мягкую коррекцию на основе частотности
-// Эквивалентно WithFrequencyThreshold(100) + WithFrequencyMultiplier(20)
 func WithLenientFrequencyCorrection() Options {
 	return NewFuncOption(func(options *SymspellOptions) {
 		options.FrequencyThreshold = 100
